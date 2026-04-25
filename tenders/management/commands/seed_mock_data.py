@@ -4,107 +4,196 @@ from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from tenders.models import Company, Tender, TenderBid, UserProfile
+from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile
 from tenders.services.risk_scoring import analyze_tender
+
+
+DEMO_USERNAMES = ['admin', 'acme', 'nova']
+DEMO_COMPANIES = {
+    'c-acme': 'Acme Corp',
+    'c-nova': 'Nova Solutions',
+    'c-alpha-infrastructure': 'Alpha Infrastructure',
+    'c-beta-civil-works': 'Beta Civil Works',
+    'c-gamma-procurement': 'Gamma Procurement',
+    'c-delta-supplies': 'Delta Supplies',
+}
+DEMO_TENDER_EXTERNAL_IDS = [
+    'T-DEMO-0001',
+    'T-DEMO-0002',
+    'T-DEMO-0003',
+    'T-DEMO-0004',
+    'T-DEMO-0005',
+    'T-DEMO-0006',
+    'T-DEMO-0007',
+]
 
 
 class Command(BaseCommand):
     help = 'Seed the database with realistic mock data and demo users for Tender Guardian.'
 
-    def handle(self, *args, **options):
-        if Tender.objects.exists() or Company.objects.exists() or User.objects.exists():
-            self.stdout.write(self.style.WARNING('Mock data already exists. Skipping seed.'))
-            return
-
-        admin_user = User.objects.create_superuser(
-            username='admin',
-            password='admin123',
-            email='admin@tender-guardian.local',
-            first_name='System',
-            last_name='Admin',
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--force',
+            action='store_true',
+            help='Delete existing demo data and seed again.',
         )
-        UserProfile.objects.create(
+
+    def handle(self, *args, **options):
+        if options['force']:
+            Tender.objects.filter(external_id__in=DEMO_TENDER_EXTERNAL_IDS).delete()
+            UserProfile.objects.filter(user__username__in=DEMO_USERNAMES).delete()
+            User.objects.filter(username__in=DEMO_USERNAMES).delete()
+            Company.objects.filter(external_id__in=list(DEMO_COMPANIES.keys())).delete()
+
+        existing_demo_tenders = Tender.objects.filter(
+            external_id__in=DEMO_TENDER_EXTERNAL_IDS
+        ).count()
+        existing_demo_companies = Company.objects.filter(
+            external_id__in=list(DEMO_COMPANIES.keys())
+        ).count()
+        existing_demo_users = User.objects.filter(username__in=DEMO_USERNAMES).count()
+
+        if existing_demo_tenders or existing_demo_companies or existing_demo_users:
+            self.stdout.write(
+                self.style.WARNING(
+                    'Existing demo data detected. The command will update demo records in place.'
+                )
+            )
+        else:
+            self.stdout.write('No existing demo dataset found. Creating demo records.')
+
+        admin_user, _ = User.objects.get_or_create(
+            username='admin',
+            defaults={
+                'email': 'admin@tender-guardian.local',
+                'first_name': 'System',
+                'last_name': 'Admin',
+                'is_staff': True,
+                'is_superuser': True,
+            },
+        )
+        admin_user.email = 'admin@tender-guardian.local'
+        admin_user.first_name = 'System'
+        admin_user.last_name = 'Admin'
+        admin_user.is_staff = True
+        admin_user.is_superuser = True
+        admin_user.set_password('admin123')
+        admin_user.save()
+        UserProfile.objects.update_or_create(
             user=admin_user,
-            role=UserProfile.Role.ADMIN,
-            external_id='u-admin',
+            defaults={
+                'role': UserProfile.Role.ADMIN,
+                'external_id': 'u-admin',
+                'company': None,
+            },
         )
 
         companies = {
-            'Acme Corp': Company.objects.create(
+            'Acme Corp': Company.objects.update_or_create(
                 external_id='c-acme',
-                name='Acme Corp',
-                total_participations=10,
-                total_wins=3,
-                completed_projects=3,
-                failed_projects=0,
-            ),
-            'Nova Solutions': Company.objects.create(
+                defaults={
+                    'name': 'Acme Corp',
+                    'total_participations': 10,
+                    'total_wins': 3,
+                    'completed_projects': 3,
+                    'failed_projects': 0,
+                },
+            )[0],
+            'Nova Solutions': Company.objects.update_or_create(
                 external_id='c-nova',
-                name='Nova Solutions',
-                total_participations=11,
-                total_wins=2,
-                completed_projects=1,
-                failed_projects=1,
-            ),
-            'Alpha Infrastructure': Company.objects.create(
-                name='Alpha Infrastructure',
-                total_participations=15,
-                total_wins=7,
-                completed_projects=6,
-                failed_projects=1,
-            ),
-            'Beta Civil Works': Company.objects.create(
-                name='Beta Civil Works',
-                total_participations=14,
-                total_wins=1,
-                completed_projects=1,
-                failed_projects=0,
-            ),
-            'Gamma Procurement': Company.objects.create(
-                name='Gamma Procurement',
-                total_participations=14,
-                total_wins=1,
-                completed_projects=1,
-                failed_projects=0,
-            ),
-            'Delta Supplies': Company.objects.create(
-                name='Delta Supplies',
-                total_participations=13,
-                total_wins=1,
-                completed_projects=1,
-                failed_projects=0,
-            ),
+                defaults={
+                    'name': 'Nova Solutions',
+                    'total_participations': 11,
+                    'total_wins': 2,
+                    'completed_projects': 1,
+                    'failed_projects': 1,
+                },
+            )[0],
+            'Alpha Infrastructure': Company.objects.update_or_create(
+                external_id='c-alpha-infrastructure',
+                defaults={
+                    'name': 'Alpha Infrastructure',
+                    'total_participations': 15,
+                    'total_wins': 7,
+                    'completed_projects': 6,
+                    'failed_projects': 1,
+                },
+            )[0],
+            'Beta Civil Works': Company.objects.update_or_create(
+                external_id='c-beta-civil-works',
+                defaults={
+                    'name': 'Beta Civil Works',
+                    'total_participations': 14,
+                    'total_wins': 1,
+                    'completed_projects': 1,
+                    'failed_projects': 0,
+                },
+            )[0],
+            'Gamma Procurement': Company.objects.update_or_create(
+                external_id='c-gamma-procurement',
+                defaults={
+                    'name': 'Gamma Procurement',
+                    'total_participations': 14,
+                    'total_wins': 1,
+                    'completed_projects': 1,
+                    'failed_projects': 0,
+                },
+            )[0],
+            'Delta Supplies': Company.objects.update_or_create(
+                external_id='c-delta-supplies',
+                defaults={
+                    'name': 'Delta Supplies',
+                    'total_participations': 13,
+                    'total_wins': 1,
+                    'completed_projects': 1,
+                    'failed_projects': 0,
+                },
+            )[0],
         }
 
-        acme_user = User.objects.create_user(
+        acme_user, _ = User.objects.get_or_create(
             username='acme',
-            password='acme123',
-            email='acme@tender-guardian.local',
+            defaults={'email': 'acme@tender-guardian.local'},
         )
-        UserProfile.objects.create(
+        acme_user.email = 'acme@tender-guardian.local'
+        acme_user.set_password('acme123')
+        acme_user.save()
+        UserProfile.objects.update_or_create(
             user=acme_user,
-            role=UserProfile.Role.COMPANY,
-            company=companies['Acme Corp'],
-            external_id='c-acme',
+            defaults={
+                'role': UserProfile.Role.COMPANY,
+                'company': companies['Acme Corp'],
+                'external_id': 'c-acme',
+            },
         )
 
-        nova_user = User.objects.create_user(
+        nova_user, _ = User.objects.get_or_create(
             username='nova',
-            password='nova123',
-            email='nova@tender-guardian.local',
+            defaults={'email': 'nova@tender-guardian.local'},
         )
-        UserProfile.objects.create(
+        nova_user.email = 'nova@tender-guardian.local'
+        nova_user.set_password('nova123')
+        nova_user.save()
+        UserProfile.objects.update_or_create(
             user=nova_user,
-            role=UserProfile.Role.COMPANY,
-            company=companies['Nova Solutions'],
-            external_id='c-nova',
+            defaults={
+                'role': UserProfile.Role.COMPANY,
+                'company': companies['Nova Solutions'],
+                'external_id': 'c-nova',
+            },
         )
 
         now = timezone.now()
 
-        def create_tender(*, participants, bids=None, late_bid_company=None, analyze=True, **kwargs):
-            tender = Tender.objects.create(participants_count=len(participants), **kwargs)
+        def create_tender(
+            *, external_id, participants, bids=None, late_bid_company=None, analyze=True, **kwargs
+        ):
+            tender, _ = Tender.objects.update_or_create(
+                external_id=external_id,
+                defaults={'participants_count': len(participants), **kwargs},
+            )
             tender.participants.set(participants)
+            tender.bids.all().delete()
             for company in participants:
                 company.update_statistics()
             for bid in bids or []:
@@ -120,6 +209,7 @@ class Command(BaseCommand):
             return tender
 
         create_tender(
+            external_id='T-DEMO-0001',
             title='Routine Office Furniture Supply',
             organization='Central Administration',
             category='Office Supplies',
@@ -145,6 +235,7 @@ class Command(BaseCommand):
         )
 
         create_tender(
+            external_id='T-DEMO-0002',
             title='Hospital Imaging Device Purchase',
             organization='National Health Agency',
             category='Medical Equipment',
@@ -171,6 +262,7 @@ class Command(BaseCommand):
 
         for offset in range(4):
             create_tender(
+                external_id=f'T-DEMO-000{offset + 3}',
                 title=f'Road Rehabilitation Package {offset + 1}',
                 organization='City Infrastructure Office',
                 category='Road Works',
@@ -197,6 +289,7 @@ class Command(BaseCommand):
             )
 
         create_tender(
+            external_id='T-DEMO-0007',
             title='Road Rehabilitation Package 5',
             organization='City Infrastructure Office',
             category='Road Works',
@@ -223,4 +316,8 @@ class Command(BaseCommand):
             late_bid_company=companies['Delta Supplies'],
         )
 
-        self.stdout.write(self.style.SUCCESS('Mock data seeded successfully.'))
+        self.stdout.write(
+            self.style.SUCCESS(
+                'Mock data seeded successfully. Demo users: admin/admin123, acme/acme123, nova/nova123.'
+            )
+        )

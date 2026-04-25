@@ -202,6 +202,29 @@ class ApiTests(APITestCase):
         self.assertIn('riskLevel', response.data[0])
         self.assertIn('riskFlags', response.data[0])
 
+    def test_admin_can_create_tender_without_participants(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            reverse('tender-list-create'),
+            {
+                'title': 'New Open Tender',
+                'organization': 'Education Board',
+                'category': 'Supplies',
+                'budget': '50000.00',
+                'average_market_price': '47000.00',
+                'final_price': '0.00',
+                'created_at': timezone.now().isoformat().replace('+00:00', 'Z'),
+                'deadline': (timezone.now() + timezone.timedelta(days=5)).isoformat().replace('+00:00', 'Z'),
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        tender = Tender.objects.get(title='New Open Tender')
+        self.assertEqual(tender.participants.count(), 0)
+        self.assertEqual(tender.participants_count, 0)
+        self.assertEqual(tender.status, Tender.Status.ACTIVE)
+        self.assertIsNone(tender.is_completed_by_winner)
+
     def test_company_can_create_application(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.company_token.key}')
         tender = Tender.objects.create(

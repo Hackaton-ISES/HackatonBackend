@@ -6,7 +6,7 @@ from django.db import transaction
 from rest_framework import serializers
 from drf_spectacular.utils import extend_schema_field
 
-from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile
+from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile, ensure_user_profile
 from tenders.services.risk_scoring import analyze_tender
 
 
@@ -36,22 +36,29 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class AuthUserSerializer(serializers.ModelSerializer):
-    id = serializers.CharField(source='profile.external_id', read_only=True)
+    id = serializers.SerializerMethodField()
     login = serializers.CharField(source='username', read_only=True)
     name = serializers.SerializerMethodField()
-    role = serializers.CharField(source='profile.role', read_only=True)
+    role = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = ['id', 'login', 'name', 'role']
 
+    def get_id(self, obj):
+        return ensure_user_profile(obj).external_id
+
     def get_name(self, obj):
-        if obj.profile.role == UserProfile.Role.ADMIN:
+        profile = ensure_user_profile(obj)
+        if profile.role == UserProfile.Role.ADMIN:
             full_name = f'{obj.first_name} {obj.last_name}'.strip()
             return full_name or 'System Admin'
-        if obj.profile.company:
-            return obj.profile.company.name
+        if profile.company:
+            return profile.company.name
         return obj.username
+
+    def get_role(self, obj):
+        return ensure_user_profile(obj).role
 
 
 class LoginResponseSerializer(serializers.Serializer):
@@ -181,14 +188,23 @@ class TenderAnalysisSerializer(serializers.ModelSerializer):
             'riskFlags',
         ]
 
-    def _get_analysis(self, obj: Tender) -> TenderRiskAnalysis:
+    def _get_analysis(self, obj: Tender) -> TenderRiskAnalysis | None:
         if not hasattr(obj, '_analysis_cache'):
-            obj._analysis_cache = analyze_tender(obj)
+            try:
+                obj._analysis_cache = obj.risk_analysis
+            except TenderRiskAnalysis.DoesNotExist:
+                if self.context.get('auto_analyze', False):
+                    obj._analysis_cache = analyze_tender(obj)
+                else:
+                    obj._analysis_cache = None
         return obj._analysis_cache
 
     @extend_schema_field(serializers.IntegerField)
     def _build_flags(self, obj):
-        reasons = self._get_analysis(obj).reasons.all()
+        analysis = self._get_analysis(obj)
+        if analysis is None:
+            return []
+        reasons = analysis.reasons.all()
         return [
             {
                 'severity': 'critical' if reason.score >= 15 else 'warning',
@@ -199,11 +215,13 @@ class TenderAnalysisSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.IntegerField)
     def get_riskScore(self, obj):
-        return self._get_analysis(obj).total_score
+        analysis = self._get_analysis(obj)
+        return analysis.total_score if analysis else 0
 
     @extend_schema_field(serializers.CharField)
     def get_riskLevel(self, obj):
-        return self._get_analysis(obj).risk_level.upper()
+        analysis = self._get_analysis(obj)
+        return analysis.risk_level.upper() if analysis else 'LOW'
 
     @extend_schema_field(RiskFlagSerializer(many=True))
     def get_riskFlags(self, obj):
@@ -228,15 +246,64 @@ class TenderDetailSerializer(TenderAnalysisSerializer):
 
     @extend_schema_field(TenderRiskAnalysisSerializer)
     def get_riskAnalysis(self, obj):
-        return TenderRiskAnalysisSerializer(self._get_analysis(obj)).data
+        analysis = self._get_analysis(obj)
+        if analysis is None:
+            return None
+        return TenderRiskAnalysisSerializer(analysis).data
 
     @extend_schema_field(RiskReasonSerializer(many=True))
     def get_reasons(self, obj):
-        return RiskReasonSerializer(self._get_analysis(obj).reasons.all(), many=True).data
+        analysis = self._get_analysis(obj)
+        if analysis is None:
+            return []
+        return RiskReasonSerializer(analysis.reasons.all(), many=True).data
 
     @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_bids(self, obj):
         return FrontendApplicationSerializer(obj.bids.all(), many=True).data
+
+
+class TenderCreateSerializer(serializers.ModelSerializer):
+    final_price = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        required=False,
+        default=Decimal('0.00'),
+    )
+
+    class Meta:
+        model = Tender
+        fields = [
+            'id',
+            'title',
+            'organization',
+            'category',
+            'budget',
+            'average_market_price',
+            'final_price',
+            'created_at',
+            'deadline',
+        ]
+        read_only_fields = ['id']
+
+    def validate(self, attrs):
+        created_at = attrs.get('created_at')
+        deadline = attrs.get('deadline')
+        if created_at and deadline and deadline <= created_at:
+            raise serializers.ValidationError({'deadline': 'Deadline must be later than created_at.'})
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        tender = Tender.objects.create(
+            participants_count=0,
+            status=Tender.Status.ACTIVE,
+            is_completed_by_winner=None,
+            winner_company=None,
+            **validated_data,
+        )
+        analyze_tender(tender)
+        return tender
 
 
 class TenderWriteSerializer(serializers.ModelSerializer):
@@ -245,6 +312,7 @@ class TenderWriteSerializer(serializers.ModelSerializer):
         queryset=Company.objects.all(),
         write_only=True,
         source='participants',
+        required=False,
     )
     winner_company_id = serializers.PrimaryKeyRelatedField(
         queryset=Company.objects.all(),
@@ -271,7 +339,6 @@ class TenderWriteSerializer(serializers.ModelSerializer):
             'participants_count',
             'winner_company_id',
             'status',
-            'is_completed_by_winner',
             'created_at',
             'deadline',
             'added_at',
@@ -290,17 +357,23 @@ class TenderWriteSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        participants = attrs.get('participants', [])
+        participants = attrs.get('participants')
         winner_company = attrs.get('winner_company')
         created_at = attrs.get('created_at', getattr(self.instance, 'created_at', None))
         deadline = attrs.get('deadline', getattr(self.instance, 'deadline', None))
 
-        if participants == [] and self.instance is None:
-            raise serializers.ValidationError({'participant_ids': 'At least one participant is required.'})
+        if participants is None and self.instance is not None:
+            participants = list(self.instance.participants.all())
+        elif participants is None:
+            participants = []
 
         if participants and winner_company and winner_company not in participants:
             raise serializers.ValidationError(
                 {'winner_company_id': 'Winner company must be one of the participants.'}
+            )
+        if not participants and winner_company:
+            raise serializers.ValidationError(
+                {'winner_company_id': 'Winner company cannot be set before participants join the tender.'}
             )
 
         if created_at and deadline and deadline <= created_at:

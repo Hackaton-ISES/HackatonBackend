@@ -108,6 +108,23 @@ class UserProfile(models.Model):
         super().save(*args, **kwargs)
 
 
+def ensure_user_profile(user: User) -> UserProfile:
+    profile = getattr(user, 'profile', None)
+    if profile:
+        if not profile.external_id:
+            profile.save(update_fields=[])
+        return profile
+
+    role = UserProfile.Role.ADMIN if user.is_staff or user.is_superuser else UserProfile.Role.COMPANY
+    profile, _ = UserProfile.objects.get_or_create(
+        user=user,
+        defaults={'role': role},
+    )
+    if not profile.external_id:
+        profile.save()
+    return profile
+
+
 class Tender(models.Model):
     class Status(models.TextChoices):
         ACTIVE = 'active', 'Active'

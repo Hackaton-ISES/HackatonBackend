@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from drf_spectacular.utils import extend_schema
 
-from tenders.models import Company, RiskReason, Tender, TenderBid, UserProfile
+from tenders.models import Company, RiskReason, Tender, TenderBid, UserProfile, ensure_user_profile
 from tenders.permissions import IsAdminOrReadOnly, IsAdminUserProfileOrStaff
 from tenders.serializers import (
     AnalyzeTenderResponseSerializer,
@@ -26,6 +26,7 @@ from tenders.serializers import (
     RiskReasonSerializer,
     RiskStatsSerializer,
     TenderAnalysisSerializer,
+    TenderCreateSerializer,
     TenderDetailSerializer,
     TenderWriteSerializer,
 )
@@ -60,6 +61,7 @@ class LoginAPIView(GenericAPIView):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data['user']
+        ensure_user_profile(user)
         token, _ = Token.objects.get_or_create(user=user)
         return Response({'user': AuthUserSerializer(user).data, 'token': token.key})
 
@@ -79,6 +81,7 @@ class MeAPIView(GenericAPIView):
 
     @extend_schema(responses=AuthUserSerializer)
     def get(self, request):
+        ensure_user_profile(request.user)
         return Response(AuthUserSerializer(request.user).data)
 
 
@@ -92,8 +95,21 @@ class TenderListCreateAPIView(generics.ListCreateAPIView):
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
-            return TenderWriteSerializer
+            return TenderCreateSerializer
         return TenderAnalysisSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['auto_analyze'] = False
+        return context
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tender = serializer.save()
+        output = TenderDetailSerializer(tender, context={'auto_analyze': False})
+        headers = self.get_success_headers(output.data)
+        return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class TenderDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
@@ -104,6 +120,11 @@ class TenderDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         if self.request.method in {'PUT', 'PATCH'}:
             return TenderWriteSerializer
         return TenderDetailSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['auto_analyze'] = True
+        return context
 
     def get_object(self):
         return get_tender_by_identifier(self.kwargs['tender_id'])

@@ -163,6 +163,21 @@ POSTGRES_CONN_MAX_AGE=60
 SEED_MOCK_DATA=false
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+CORS_ALLOW_CREDENTIALS=True
+```
+
+## CORS
+The backend is configured to allow frontend requests from:
+
+- `http://localhost:5173`
+- `http://127.0.0.1:5173`
+
+Configuration is environment-driven:
+
+```env
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+CORS_ALLOW_CREDENTIALS=True
 ```
 
 ### Optional SQLite Override for Testing
@@ -270,4 +285,3 @@ http://localhost:8000/api/docs/
 This repository is backend-only.
 
 It is structured to support a frontend tender platform, but the frontend code is not part of this repository.
-
