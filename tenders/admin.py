@@ -1,7 +1,15 @@
 from django.contrib import admin
-from unfold.admin import ModelAdmin
+from unfold.admin import ModelAdmin, TabularInline
 
-from tenders.models import Company, RiskReason, Tender, TenderRiskAnalysis
+from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile
+
+
+class TenderBidInline(TabularInline):
+    model = TenderBid
+    extra = 0
+    autocomplete_fields = ('company',)
+    fields = ('company', 'bid_price', 'is_winner', 'created_at')
+    readonly_fields = ('created_at',)
 
 
 @admin.register(Company)
@@ -17,6 +25,14 @@ class CompanyAdmin(ModelAdmin):
     )
     search_fields = ('name',)
     ordering = ('name',)
+
+
+@admin.register(UserProfile)
+class UserProfileAdmin(ModelAdmin):
+    list_display = ('user', 'role', 'company', 'created_at')
+    list_filter = ('role',)
+    search_fields = ('user__username', 'company__name')
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(Tender)
@@ -38,6 +54,7 @@ class TenderAdmin(ModelAdmin):
     filter_horizontal = ('participants',)
     readonly_fields = ('added_at', 'updated_at')
     ordering = ('-created_at',)
+    inlines = (TenderBidInline,)
 
 
 @admin.register(TenderRiskAnalysis)
@@ -50,6 +67,7 @@ class TenderRiskAnalysisAdmin(ModelAdmin):
         'company_history_score',
         'consecutive_wins_score',
         'participants_score',
+        'fake_competition_score',
         'analyzed_at',
     )
     list_filter = ('risk_level',)
@@ -58,11 +76,20 @@ class TenderRiskAnalysisAdmin(ModelAdmin):
         'tender__organization',
         'tender__winner_company__name',
     )
-    readonly_fields = ('analyzed_at',)
+    readonly_fields = ('analyzed_at', 'ai_summary')
 
 
 @admin.register(RiskReason)
 class RiskReasonAdmin(ModelAdmin):
     list_display = ('title', 'analysis', 'score', 'created_at')
+    list_filter = ('score', 'analysis__risk_level')
     search_fields = ('title', 'description', 'analysis__tender__title')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(TenderBid)
+class TenderBidAdmin(ModelAdmin):
+    list_display = ('tender', 'company', 'bid_price', 'is_winner', 'created_at')
+    list_filter = ('is_winner', 'tender__organization', 'tender__category')
+    search_fields = ('tender__title', 'company__name')
     readonly_fields = ('created_at',)

@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.contrib import admin
+from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -10,6 +11,7 @@ HUNDRED_DECIMAL = Decimal('100')
 
 
 class Company(models.Model):
+    external_id = models.CharField(max_length=50, unique=True, blank=True, default='')
     name = models.CharField(max_length=255, unique=True)
     total_participations = models.PositiveIntegerField(default=0)
     total_wins = models.PositiveIntegerField(default=0)
@@ -24,14 +26,20 @@ class Company(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    def save(self, *args, **kwargs):
+        if not self.external_id:
+            slug = ''.join(char.lower() if char.isalnum() else '-' for char in self.name).strip('-')
+            self.external_id = f'c-{slug[:40] or "company"}'
+        super().save(*args, **kwargs)
+
     @property
     @admin.display(description='Failure Rate')
     def failure_rate(self) -> Decimal:
         if self.total_wins == 0:
             return ZERO_DECIMAL
-        return ((Decimal(self.failed_projects) / Decimal(self.total_wins)) * HUNDRED_DECIMAL).quantize(
-            Decimal('0.01')
-        )
+        return (
+            (Decimal(self.failed_projects) / Decimal(self.total_wins)) * HUNDRED_DECIMAL
+        ).quantize(Decimal('0.01'))
 
     @property
     @admin.display(description='Win Rate')
@@ -65,12 +73,48 @@ class Company(models.Model):
             )
 
 
+class UserProfile(models.Model):
+    class Role(models.TextChoices):
+        ADMIN = 'admin', 'Admin'
+        COMPANY = 'company', 'Company'
+
+    external_id = models.CharField(max_length=50, unique=True, blank=True, default='')
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.COMPANY)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='user_profiles',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['user__username']
+
+    def __str__(self) -> str:
+        return f'{self.user.username} ({self.role})'
+
+    def save(self, *args, **kwargs):
+        if not self.external_id:
+            if self.role == self.Role.ADMIN:
+                self.external_id = f'u-{self.user.username.lower()}'
+            elif self.company_id:
+                self.external_id = self.company.external_id
+            else:
+                self.external_id = f'u-{self.user.username.lower()}'
+        super().save(*args, **kwargs)
+
+
 class Tender(models.Model):
     class Status(models.TextChoices):
         ACTIVE = 'active', 'Active'
         COMPLETED = 'completed', 'Completed'
         CANCELLED = 'cancelled', 'Cancelled'
 
+    external_id = models.CharField(max_length=50, unique=True, blank=True, default='')
     title = models.CharField(max_length=255)
     organization = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
@@ -108,6 +152,10 @@ class Tender(models.Model):
             raise ValidationError({'deadline': 'Deadline must be later than created_at.'})
 
     def save(self, *args, **kwargs):
+        if not self.external_id:
+            year = self.created_at.year if self.created_at else 2024
+            next_number = (Tender.objects.exclude(pk=self.pk).count() + 1)
+            self.external_id = f'T-{year}-{next_number:04d}'
         self.full_clean()
         super().save(*args, **kwargs)
 
@@ -121,8 +169,15 @@ class Tender(models.Model):
             Decimal('0.01')
         )
 
+    @property
+    def budget_difference_percent(self) -> Decimal:
+        if self.budget in (None, ZERO_DECIMAL):
+            return ZERO_DECIMAL
+        difference = self.final_price - self.budget
+        return ((difference / self.budget) * HUNDRED_DECIMAL).quantize(Decimal('0.01'))
+
     def get_actual_participants_count(self) -> int:
-        if self.pk and hasattr(self, 'participants'):
+        if self.pk:
             participants_total = self.participants.count()
             if participants_total:
                 return participants_total
@@ -150,6 +205,8 @@ class TenderRiskAnalysis(models.Model):
     company_history_score = models.PositiveIntegerField(default=0)
     consecutive_wins_score = models.PositiveIntegerField(default=0)
     participants_score = models.PositiveIntegerField(default=0)
+    fake_competition_score = models.PositiveIntegerField(default=0)
+    ai_summary = models.TextField(blank=True, default='')
     analyzed_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -158,100 +215,16 @@ class TenderRiskAnalysis(models.Model):
     def __str__(self) -> str:
         return f'Risk analysis for {self.tender}'
 
-    def calculate_price_score(self) -> int:
-        difference_percent = self.tender.price_difference_percent
-        if difference_percent < Decimal('10'):
-            return 0
-        if difference_percent < Decimal('20'):
-            return 10
-        if difference_percent < Decimal('35'):
-            return 20
-        if difference_percent < Decimal('50'):
-            return 30
-        return 40
-
-    def calculate_company_history_score(self) -> int:
-        winner = self.tender.winner_company
-        if winner is None:
-            return 0
-        if winner.total_wins == 0:
-            return 30 if winner.failed_projects > 0 else 0
-
-        failure_ratio = (
-            Decimal(winner.failed_projects) / Decimal(winner.total_wins)
-        ) * HUNDRED_DECIMAL
-
-        if failure_ratio < Decimal('10'):
-            return 0
-        if failure_ratio < Decimal('30'):
-            return 10
-        if failure_ratio < Decimal('50'):
-            return 20
-        return 30
-
-    def calculate_consecutive_wins_count(self) -> int:
-        tender = self.tender
-        if tender.winner_company_id is None:
-            return 0
-
-        matching_tenders = (
-            Tender.objects.filter(
-                organization=tender.organization,
-                category=tender.category,
-                created_at__lte=tender.created_at,
-            )
-            .exclude(status=Tender.Status.CANCELLED)
-            .select_related('winner_company')
-            .order_by('created_at', 'id')
-        )
-
-        consecutive_count = 0
-        current_streak = 0
-        previous_winner_id = None
-
-        for item in matching_tenders:
-            if item.winner_company_id and item.winner_company_id == previous_winner_id:
-                current_streak += 1
-            elif item.winner_company_id:
-                current_streak = 1
-            else:
-                current_streak = 0
-
-            previous_winner_id = item.winner_company_id
-
-            if item.pk == tender.pk:
-                consecutive_count = (
-                    current_streak if item.winner_company_id == tender.winner_company_id else 0
-                )
-                break
-
-        return consecutive_count
-
-    def calculate_consecutive_wins_score(self) -> int:
-        wins_count = self.calculate_consecutive_wins_count()
-        if wins_count <= 2:
-            return 0
-        if wins_count == 3:
-            return 10
-        if wins_count == 4:
-            return 20
-        return 30
-
-    def calculate_participants_score(self) -> int:
-        return 20 if self.tender.get_actual_participants_count() <= 1 else 0
-
     def calculate_total_score(self) -> int:
-        self.price_score = self.calculate_price_score()
-        self.company_history_score = self.calculate_company_history_score()
-        self.consecutive_wins_score = self.calculate_consecutive_wins_score()
-        self.participants_score = self.calculate_participants_score()
-        return min(
+        self.total_score = min(
             self.price_score
             + self.company_history_score
             + self.consecutive_wins_score
-            + self.participants_score,
+            + self.participants_score
+            + self.fake_competition_score,
             100,
         )
+        return self.total_score
 
     def update_risk_level(self) -> str:
         if self.total_score >= 70:
@@ -263,7 +236,7 @@ class TenderRiskAnalysis(models.Model):
         return self.risk_level
 
     def save(self, *args, **kwargs):
-        self.total_score = self.calculate_total_score()
+        self.calculate_total_score()
         self.update_risk_level()
         super().save(*args, **kwargs)
 
@@ -284,3 +257,50 @@ class RiskReason(models.Model):
 
     def __str__(self) -> str:
         return self.title
+
+
+class TenderBid(models.Model):
+    external_id = models.CharField(max_length=50, unique=True, blank=True, default='')
+    tender = models.ForeignKey(Tender, on_delete=models.CASCADE, related_name='bids')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='bids')
+    bid_price = models.DecimalField(max_digits=14, decimal_places=2)
+    product_name = models.CharField(max_length=120, blank=True, default='')
+    product_description = models.TextField(blank=True, default='')
+    is_winner = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tender', 'company'],
+                name='unique_tender_company_bid',
+            ),
+        ]
+        ordering = ['bid_price', 'id']
+
+    def __str__(self) -> str:
+        return f'{self.company} bid for {self.tender}'
+
+    @property
+    def status(self) -> str:
+        if self.is_winner:
+            return 'won'
+        if self.tender.winner_company_id:
+            return 'lost'
+        return 'pending'
+
+    def clean(self) -> None:
+        if self.bid_price <= ZERO_DECIMAL:
+            raise ValidationError({'bid_price': 'Bid price must be positive.'})
+
+    def save(self, *args, **kwargs):
+        if not self.external_id:
+            self.external_id = f'A-{timezone_now_compact()}'
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+def timezone_now_compact() -> str:
+    from django.utils import timezone
+
+    return timezone.now().strftime('%Y%m%d%H%M%S%f')[-10:].upper()
