@@ -26,11 +26,14 @@ class RiskAnalysisServiceTests(APITestCase):
         tender = Tender.objects.create(
             title='Medical Equipment Procurement',
             organization='Health Ministry',
+            category='Medical Equipment',
             budget=Decimal('100000.00'),
             average_market_price=Decimal('70000.00'),
             final_price=Decimal('98000.00'),
             participants_count=2,
             winner_company=winner,
+            status=Tender.Status.COMPLETED,
+            is_completed_by_winner=True,
             created_at=now,
             deadline=now + timezone.timedelta(days=1),
         )
@@ -80,11 +83,13 @@ class TenderApiTests(APITestCase):
         payload = {
             'title': 'Road Repair Contract',
             'organization': 'City Council',
+            'category': 'Infrastructure',
             'budget': '200000.00',
             'average_market_price': '140000.00',
             'final_price': '195000.00',
             'participant_ids': [company_one.id, company_two.id],
             'winner_company_id': company_two.id,
+            'status': Tender.Status.ACTIVE,
             'created_at': '2026-04-20T10:00:00Z',
             'deadline': '2026-04-21T10:00:00Z',
         }

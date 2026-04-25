@@ -3,7 +3,6 @@ from rest_framework import generics
 from tenders.models import Tender
 from tenders.serializers import TenderAnalysisSerializer, TenderCreateSerializer
 
-
 class TenderListCreateAPIView(generics.ListCreateAPIView):
     queryset = (
         Tender.objects.select_related('winner_company')

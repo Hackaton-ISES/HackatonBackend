@@ -8,7 +8,16 @@ from tenders.services.risk_analysis import analyze_tender_risk
 class CompanySerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ['id', 'name', 'total_participations', 'total_wins']
+        fields = [
+            'id',
+            'name',
+            'total_participations',
+            'total_wins',
+            'completed_projects',
+            'failed_projects',
+            'created_at',
+            'updated_at',
+        ]
 
 
 class TenderAnalysisSerializer(serializers.ModelSerializer):
@@ -24,14 +33,19 @@ class TenderAnalysisSerializer(serializers.ModelSerializer):
             'id',
             'title',
             'organization',
+            'category',
             'budget',
             'average_market_price',
             'final_price',
             'participants_count',
             'participants',
             'winner_company',
+            'status',
+            'is_completed_by_winner',
             'created_at',
             'deadline',
+            'added_at',
+            'updated_at',
             'risk_score',
             'risk_level',
             'reasons',
@@ -76,19 +90,32 @@ class TenderCreateSerializer(serializers.ModelSerializer):
             'id',
             'title',
             'organization',
+            'category',
             'budget',
             'average_market_price',
             'final_price',
             'participant_ids',
             'participants_count',
             'winner_company_id',
+            'status',
+            'is_completed_by_winner',
             'created_at',
             'deadline',
+            'added_at',
+            'updated_at',
             'risk_score',
             'risk_level',
             'reasons',
         ]
-        read_only_fields = ['id', 'participants_count', 'risk_score', 'risk_level', 'reasons']
+        read_only_fields = [
+            'id',
+            'participants_count',
+            'added_at',
+            'updated_at',
+            'risk_score',
+            'risk_level',
+            'reasons',
+        ]
 
     def validate(self, attrs):
         participants = attrs.get('participants', [])
