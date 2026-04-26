@@ -271,10 +271,11 @@ def calculate_fake_competition_score(company: Company) -> ScoreResult:
 
 
 @transaction.atomic
-def analyze_company(company: Company) -> CompanySuspicionAnalysis:
+def analyze_company(company: Company, *, generate_summary: bool = False) -> CompanySuspicionAnalysis:
     company = Company.objects.get(pk=company.pk)
     company.update_statistics()
     analysis, _ = CompanySuspicionAnalysis.objects.get_or_create(company=company)
+    existing_ai_summary = analysis.ai_summary
     analysis.reasons.all().delete()
 
     price_result = calculate_price_score(company)
@@ -286,7 +287,7 @@ def analyze_company(company: Company) -> CompanySuspicionAnalysis:
     analysis.failed_delivery_score = failed_delivery_result.score
     analysis.consecutive_wins_score = consecutive_result.score
     analysis.fake_competition_score = fake_competition_result.score
-    analysis.ai_summary = ''
+    analysis.ai_summary = existing_ai_summary
     analysis.save()
 
     all_reasons = (
@@ -307,14 +308,24 @@ def analyze_company(company: Company) -> CompanySuspicionAnalysis:
         ]
     )
     analysis = CompanySuspicionAnalysis.objects.prefetch_related('reasons').get(pk=analysis.pk)
-    analysis.ai_summary = generate_company_summary(company=company, analysis=analysis)
-    if analysis.ai_summary:
+    if generate_summary:
+        analysis.ai_summary = generate_company_summary(company=company, analysis=analysis)
+        if analysis.ai_summary:
+            analysis.save(update_fields=['ai_summary', 'analyzed_at'])
+    elif analysis.suspicion_level != CompanySuspicionAnalysis.SuspicionLevel.HIGH and analysis.ai_summary:
+        analysis.ai_summary = ''
         analysis.save(update_fields=['ai_summary', 'analyzed_at'])
     return CompanySuspicionAnalysis.objects.prefetch_related('reasons').get(pk=analysis.pk)
 
 
-def analyze_all_companies() -> None:
+def analyze_all_companies(*, generate_summary: bool = False) -> None:
     for company in Company.objects.all().order_by('id'):
+        analyze_company(company, generate_summary=generate_summary)
+
+
+def analyze_companies(company_ids) -> None:
+    normalized_ids = {company_id for company_id in company_ids if company_id}
+    for company in Company.objects.filter(id__in=normalized_ids).order_by('id'):
         analyze_company(company)
 
 

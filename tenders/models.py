@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.contrib import admin
 from django.contrib.auth.models import User
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -388,6 +389,30 @@ class TenderBid(models.Model):
             self.external_id = f'A-{timezone_now_compact()}'
         self.full_clean()
         super().save(*args, **kwargs)
+
+
+class TenderAuditApproval(models.Model):
+    tender = models.ForeignKey(Tender, on_delete=models.CASCADE, related_name='audit_approvals')
+    application = models.ForeignKey(TenderBid, on_delete=models.CASCADE, related_name='audit_approvals')
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    note = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tender', 'application'],
+                name='unique_tender_application_audit_approval',
+            ),
+        ]
+        ordering = ['-created_at', '-id']
+
+    def __str__(self) -> str:
+        return f'Audit approval for {self.application}'
+
+    def clean(self) -> None:
+        if self.application_id and self.tender_id and self.application.tender_id != self.tender_id:
+            raise ValidationError({'application': 'Application does not belong to this tender.'})
 
 
 def timezone_now_compact() -> str:

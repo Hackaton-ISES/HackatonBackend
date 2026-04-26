@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 
-from tenders.models import Company, Tender, TenderBid
+from tenders.models import Company, CompanySuspicionAnalysis, Tender, TenderAuditApproval, TenderBid
 from tenders.services.risk_scoring import analyze_company
 
 
@@ -140,7 +140,7 @@ def _participant_reasons(*, company: Company, analysis, bid: TenderBid, baseline
             )
         )
 
-    if points >= 60:
+    if analysis.suspicion_level == CompanySuspicionAnalysis.SuspicionLevel.HIGH:
         recommendation = 'audit_required'
         label = 'Do not award without audit'
     elif points >= 30:
@@ -204,10 +204,13 @@ def get_tender_award_risk(tender: Tender) -> dict:
 
 
 def ensure_application_can_be_awarded(application: TenderBid) -> None:
-    award_risk = get_tender_award_risk(application.tender)
-    participant = next(
-        (item for item in award_risk['participants'] if item['applicationId'] == application.external_id),
-        None,
-    )
-    if participant and participant['recommendation'] == 'audit_required':
-        raise ValueError('Audit approval is required before awarding this company.')
+    analysis = analyze_company(application.company)
+    if analysis.suspicion_level != CompanySuspicionAnalysis.SuspicionLevel.HIGH:
+        return
+
+    has_approval = TenderAuditApproval.objects.filter(
+        tender=application.tender,
+        application=application,
+    ).exists()
+    if not has_approval:
+        raise ValueError('Audit approval is required for HIGH risk companies.')

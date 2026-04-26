@@ -1,6 +1,6 @@
 from django.contrib.auth import logout
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
@@ -8,13 +8,16 @@ from rest_framework.authtoken.models import Token
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
-from tenders.models import Company, Tender, TenderBid, UserProfile, ensure_user_profile
+from tenders.models import Company, Tender, TenderAuditApproval, TenderBid, UserProfile, ensure_user_profile
 from tenders.pagination import StandardResultsSetPagination
 from tenders.permissions import IsAdminOrReadOnly, IsAdminUserProfileOrStaff
 from tenders.serializers import (
     AnalyzeCompanyResponseSerializer,
     ApplicationSerializer,
     ApplicationStatusSerializer,
+    AuditApprovalRequestSerializer,
+    AuditApprovalResponseSerializer,
+    AuditApprovalStatusSerializer,
     AwardRiskResponseSerializer,
     AuthUserSerializer,
     CompanyDetailSerializer,
@@ -34,7 +37,7 @@ from tenders.serializers import (
     TenderWriteSerializer,
 )
 from tenders.services.award_risk import get_tender_award_risk
-from tenders.services.risk_scoring import analyze_all_companies, analyze_company, get_company_stats
+from tenders.services.risk_scoring import analyze_companies, analyze_company, get_company_stats
 from tenders.services.tender_finalization import finalize_tender_winner
 
 
@@ -102,12 +105,28 @@ class CompanyListAPIView(generics.ListCreateAPIView):
     pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
-        queryset = Company.objects.select_related('suspicion_analysis').prefetch_related(
-            'suspicion_analysis__reasons',
+        queryset = (
+            Company.objects.select_related('suspicion_analysis')
+            .prefetch_related('suspicion_analysis__reasons')
+            .annotate(
+                suspicion_order=Case(
+                    When(suspicion_analysis__suspicion_level='high', then=Value(0)),
+                    When(suspicion_analysis__suspicion_level='medium', then=Value(1)),
+                    When(suspicion_analysis__suspicion_level='low', then=Value(2)),
+                    default=Value(3),
+                    output_field=IntegerField(),
+                )
+            )
         )
         if self.request.query_params.get('includeWonTenders') == 'true':
             queryset = queryset.prefetch_related('won_tenders')
-        return queryset.order_by('name')
+        return queryset.order_by(
+            'suspicion_order',
+            '-suspicion_analysis__total_score',
+            '-total_wins',
+            'name',
+            'id',
+        )
 
     def get_permissions(self):
         if self.request.method == 'POST':
@@ -143,13 +162,24 @@ class CompanyDetailAPIView(generics.RetrieveAPIView):
 
 
 class TenderListCreateAPIView(generics.ListCreateAPIView):
-    queryset = (
-        Tender.objects.select_related('winner_company')
-        .prefetch_related('participants', 'bids__company')
-        .order_by('-created_at', '-id')
-    )
     permission_classes = [IsAdminOrReadOnly]
     pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        return (
+            Tender.objects.select_related('winner_company')
+            .prefetch_related('participants', 'bids__company')
+            .annotate(
+                status_order=Case(
+                    When(status=Tender.Status.ACTIVE, then=Value(0)),
+                    When(status=Tender.Status.COMPLETED, then=Value(1)),
+                    When(status=Tender.Status.CANCELLED, then=Value(2)),
+                    default=Value(3),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by('status_order', '-created_at', '-id')
+        )
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
@@ -160,7 +190,6 @@ class TenderListCreateAPIView(generics.ListCreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         tender = serializer.save()
-        analyze_all_companies()
         output = TenderDetailSerializer(tender)
         headers = self.get_success_headers(output.data)
         return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
@@ -188,8 +217,11 @@ class TenderDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         return super().update(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
+        affected_company_ids = set(instance.participants.values_list('id', flat=True))
+        if instance.winner_company_id:
+            affected_company_ids.add(instance.winner_company_id)
         instance.delete()
-        analyze_all_companies()
+        analyze_companies(affected_company_ids)
 
 
 class ApplicationListCreateAPIView(generics.ListCreateAPIView):
@@ -246,7 +278,7 @@ class ApplicationListCreateAPIView(generics.ListCreateAPIView):
         tender.participants.add(company)
         tender.participants_count = tender.get_actual_participants_count()
         tender.save(update_fields=['participants_count', 'updated_at'])
-        analyze_all_companies()
+        analyze_company(company)
 
         output = FrontendApplicationSerializer(application)
         return Response(output.data, status=status.HTTP_201_CREATED)
@@ -328,6 +360,66 @@ class TenderAwardRiskAPIView(GenericAPIView):
         return Response(get_tender_award_risk(tender))
 
 
+class TenderAuditApprovalAPIView(GenericAPIView):
+    permission_classes = [IsAdminUserProfileOrStaff]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return AuditApprovalRequestSerializer
+        return AuditApprovalStatusSerializer
+
+    def _get_tender_and_application(self, tender_id: str, application_id: str):
+        tender = get_tender_by_identifier(tender_id)
+        application = get_bid_by_identifier(application_id)
+        if application.tender_id != tender.id:
+            return tender, application, Response(
+                {'detail': 'Application does not belong to this tender.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return tender, application, None
+
+    @extend_schema(responses=AuditApprovalStatusSerializer)
+    def get(self, request, tender_id: str, application_id: str):
+        tender, application, error_response = self._get_tender_and_application(tender_id, application_id)
+        if error_response:
+            return error_response
+
+        approval = TenderAuditApproval.objects.filter(tender=tender, application=application).select_related(
+            'approved_by'
+        ).first()
+        if not approval:
+            return Response(
+                {
+                    'tenderId': tender.external_id,
+                    'applicationId': application.external_id,
+                    'approved': False,
+                    'approvedBy': None,
+                    'note': '',
+                    'created_at': None,
+                }
+            )
+        return Response(AuditApprovalResponseSerializer(approval).data)
+
+    @transaction.atomic
+    @extend_schema(request=AuditApprovalRequestSerializer, responses=AuditApprovalResponseSerializer)
+    def post(self, request, tender_id: str, application_id: str):
+        tender, application, error_response = self._get_tender_and_application(tender_id, application_id)
+        if error_response:
+            return error_response
+
+        serializer = AuditApprovalRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approval, _ = TenderAuditApproval.objects.update_or_create(
+            tender=tender,
+            application=application,
+            defaults={
+                'approved_by': request.user,
+                'note': serializer.validated_data.get('note', ''),
+            },
+        )
+        return Response(AuditApprovalResponseSerializer(approval).data, status=status.HTTP_201_CREATED)
+
+
 class CompanyAnalyzeAPIView(GenericAPIView):
     permission_classes = [IsAdminUserProfileOrStaff]
     serializer_class = AnalyzeCompanyResponseSerializer
@@ -379,7 +471,26 @@ class UserListCreateAPIView(GenericAPIView):
 
     @extend_schema(responses=CompanySerializer(many=True))
     def get(self, request):
-        companies = Company.objects.order_by('name')
+        companies = (
+            Company.objects.select_related('suspicion_analysis')
+            .prefetch_related('suspicion_analysis__reasons')
+            .annotate(
+                suspicion_order=Case(
+                    When(suspicion_analysis__suspicion_level='high', then=Value(0)),
+                    When(suspicion_analysis__suspicion_level='medium', then=Value(1)),
+                    When(suspicion_analysis__suspicion_level='low', then=Value(2)),
+                    default=Value(3),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by(
+                'suspicion_order',
+                '-suspicion_analysis__total_score',
+                '-total_wins',
+                'name',
+                'id',
+            )
+        )
         return Response(CompanySerializer(companies, many=True).data)
 
     @extend_schema(request=CompanyRegistrationSerializer, responses=LoginResponseSerializer)

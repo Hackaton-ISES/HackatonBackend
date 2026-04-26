@@ -2,7 +2,7 @@ from django.db import transaction
 
 from tenders.models import Tender, TenderBid
 from tenders.services.award_risk import ensure_application_can_be_awarded
-from tenders.services.risk_scoring import analyze_all_companies
+from tenders.services.risk_scoring import analyze_companies
 
 
 @transaction.atomic
@@ -22,5 +22,5 @@ def finalize_tender_winner(*, tender: Tender, application: TenderBid) -> Tender:
     tender.status = Tender.Status.COMPLETED
     tender.save(update_fields=['winner_company', 'final_price', 'status', 'updated_at'])
 
-    analyze_all_companies()
+    analyze_companies(tender.participants.values_list('id', flat=True))
     return tender

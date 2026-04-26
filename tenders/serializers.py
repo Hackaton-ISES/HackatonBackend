@@ -11,12 +11,13 @@ from tenders.models import (
     CompanySuspicionAnalysis,
     CompanySuspicionReason,
     Tender,
+    TenderAuditApproval,
     TenderBid,
     UserProfile,
     ensure_user_profile,
 )
 from tenders.services.account_creation import create_company_account
-from tenders.services.risk_scoring import analyze_all_companies, analyze_company
+from tenders.services.risk_scoring import analyze_company
 
 
 class SuspicionReasonSerializer(serializers.ModelSerializer):
@@ -376,7 +377,6 @@ class TenderWriteSerializer(serializers.ModelSerializer):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
-        analyze_all_companies()
         return instance
 
     @extend_schema_field(serializers.CharField(allow_null=True))
@@ -445,7 +445,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
         application.tender.participants.add(application.company)
         application.tender.participants_count = application.tender.get_actual_participants_count()
         application.tender.save(update_fields=['participants_count', 'updated_at'])
-        analyze_all_companies()
+        analyze_company(application.company)
         return application
 
 
@@ -467,7 +467,7 @@ class FrontendApplicationSerializer(serializers.ModelSerializer):
     productName = serializers.CharField(source='product_name', read_only=True)
     productDescription = serializers.CharField(source='product_description', read_only=True)
     status = serializers.SerializerMethodField()
-    submittedAt = serializers.SerializerMethodField()
+    submittedAt = serializers.DateTimeField(source='created_at', read_only=True)
 
     class Meta:
         model = TenderBid
@@ -489,9 +489,6 @@ class FrontendApplicationSerializer(serializers.ModelSerializer):
         if obj.tender.winner_company_id:
             return 'Lost'
         return 'Pending'
-
-    def get_submittedAt(self, obj):
-        return obj.created_at.date().isoformat()
 
 
 class FrontendApplicationCreateSerializer(serializers.Serializer):
@@ -556,6 +553,34 @@ class FinalizeWinnerResponseSerializer(serializers.Serializer):
     winnerApplicationId = serializers.CharField()
     locked = serializers.BooleanField()
     applications = FrontendApplicationSerializer(many=True)
+
+
+class AuditApprovalRequestSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class AuditApprovalResponseSerializer(serializers.ModelSerializer):
+    tenderId = serializers.CharField(source='tender.external_id', read_only=True)
+    applicationId = serializers.CharField(source='application.external_id', read_only=True)
+    approved = serializers.SerializerMethodField()
+    approvedBy = serializers.CharField(source='approved_by.username', read_only=True)
+
+    class Meta:
+        model = TenderAuditApproval
+        fields = ['tenderId', 'applicationId', 'approved', 'approvedBy', 'note', 'created_at']
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_approved(self, obj):
+        return True
+
+
+class AuditApprovalStatusSerializer(serializers.Serializer):
+    tenderId = serializers.CharField()
+    applicationId = serializers.CharField()
+    approved = serializers.BooleanField()
+    approvedBy = serializers.CharField(allow_null=True)
+    note = serializers.CharField(allow_blank=True)
+    created_at = serializers.DateTimeField(allow_null=True)
 
 
 class AwardRiskReasonSerializer(serializers.Serializer):

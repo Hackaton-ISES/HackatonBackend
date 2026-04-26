@@ -12,6 +12,7 @@ from tenders.views import (
     LogoutAPIView,
     MeAPIView,
     TenderAwardRiskAPIView,
+    TenderAuditApprovalAPIView,
     TenderDetailAPIView,
     TenderFinalizeWinnerAPIView,
     TenderListCreateAPIView,
@@ -29,6 +30,11 @@ urlpatterns = [
     path('tenders', TenderListCreateAPIView.as_view(), name='tender-list-create'),
     path('tenders/<str:tender_id>', TenderDetailAPIView.as_view(), name='tender-detail'),
     path('tenders/<str:tender_id>/award-risk', TenderAwardRiskAPIView.as_view(), name='tender-award-risk'),
+    path(
+        'tenders/<str:tender_id>/applications/<str:application_id>/audit-approval',
+        TenderAuditApprovalAPIView.as_view(),
+        name='tender-application-audit-approval',
+    ),
     path(
         'tenders/<str:tender_id>/finalize-winner',
         TenderFinalizeWinnerAPIView.as_view(),

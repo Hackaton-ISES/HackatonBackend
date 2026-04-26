@@ -7,6 +7,7 @@ from tenders.models import (
     CompanySuspicionAnalysis,
     CompanySuspicionReason,
     Tender,
+    TenderAuditApproval,
     TenderBid,
     UserProfile,
 )
@@ -157,4 +158,11 @@ class TenderBidAdmin(ModelAdmin):
     list_display = ('tender', 'company', 'bid_price', 'is_winner', 'created_at')
     list_filter = ('is_winner', 'tender__organization', 'tender__category')
     search_fields = ('tender__title', 'company__name')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(TenderAuditApproval)
+class TenderAuditApprovalAdmin(ModelAdmin):
+    list_display = ('tender', 'application', 'approved_by', 'created_at')
+    search_fields = ('tender__title', 'application__external_id', 'application__company__name', 'approved_by__username')
     readonly_fields = ('created_at',)
