@@ -31,6 +31,7 @@ class SuspicionFlagSerializer(serializers.Serializer):
 
 
 class CompanySuspicionAnalysisSerializer(serializers.ModelSerializer):
+    aiSummary = serializers.CharField(source='ai_summary', read_only=True)
     reasons = SuspicionReasonSerializer(many=True, read_only=True)
 
     class Meta:
@@ -43,6 +44,7 @@ class CompanySuspicionAnalysisSerializer(serializers.ModelSerializer):
             'consecutive_wins_score',
             'fake_competition_score',
             'ai_summary',
+            'aiSummary',
             'analyzed_at',
             'reasons',
         ]
@@ -53,6 +55,8 @@ class CompanySerializer(serializers.ModelSerializer):
     suspicionScore = serializers.SerializerMethodField()
     suspicionLevel = serializers.SerializerMethodField()
     suspicionFlags = serializers.SerializerMethodField()
+    aiSummary = serializers.SerializerMethodField()
+    wonTendersCount = serializers.SerializerMethodField()
 
     class Meta:
         model = Company
@@ -68,6 +72,8 @@ class CompanySerializer(serializers.ModelSerializer):
             'suspicionScore',
             'suspicionLevel',
             'suspicionFlags',
+            'aiSummary',
+            'wonTendersCount',
         ]
 
     def _get_analysis(self, obj: Company) -> CompanySuspicionAnalysis:
@@ -96,13 +102,22 @@ class CompanySerializer(serializers.ModelSerializer):
             for reason in self._get_analysis(obj).reasons.all()
         ]
 
+    @extend_schema_field(serializers.CharField)
+    def get_aiSummary(self, obj):
+        return self._get_analysis(obj).ai_summary
+
+    @extend_schema_field(serializers.IntegerField)
+    def get_wonTendersCount(self, obj):
+        return obj.total_wins
+
 
 class CompanyDetailSerializer(CompanySerializer):
     suspicionAnalysis = serializers.SerializerMethodField()
     reasons = serializers.SerializerMethodField()
+    wonTenders = serializers.SerializerMethodField()
 
     class Meta(CompanySerializer.Meta):
-        fields = CompanySerializer.Meta.fields + ['suspicionAnalysis', 'reasons']
+        fields = CompanySerializer.Meta.fields + ['wonTenders', 'suspicionAnalysis', 'reasons']
 
     @extend_schema_field(CompanySuspicionAnalysisSerializer)
     def get_suspicionAnalysis(self, obj):
@@ -111,6 +126,27 @@ class CompanyDetailSerializer(CompanySerializer):
     @extend_schema_field(SuspicionReasonSerializer(many=True))
     def get_reasons(self, obj):
         return SuspicionReasonSerializer(self._get_analysis(obj).reasons.all(), many=True).data
+
+    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
+    def get_wonTenders(self, obj):
+        prefetched_wins = getattr(obj, '_prefetched_objects_cache', {}).get('won_tenders')
+        won_tenders = prefetched_wins if prefetched_wins is not None else obj.won_tenders.all()
+        won_tenders = sorted(won_tenders, key=lambda tender: (tender.created_at, tender.id), reverse=True)[:10]
+        return [
+            {
+                'id': tender.external_id,
+                'title': tender.title,
+                'organization': tender.organization,
+                'category': tender.category,
+                'budget': tender.budget,
+                'finalPrice': tender.final_price,
+                'status': tender.status,
+                'createdAt': tender.created_at,
+                'deadline': tender.deadline,
+                'isCompletedByWinner': tender.is_completed_by_winner,
+            }
+            for tender in won_tenders
+        ]
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
@@ -475,6 +511,7 @@ class AnalyzeCompanyResponseSerializer(serializers.ModelSerializer):
     companyId = serializers.CharField(source='company.external_id', read_only=True)
     companyName = serializers.CharField(source='company.name', read_only=True)
     totalScore = serializers.IntegerField(source='total_score', read_only=True)
+    aiSummary = serializers.CharField(source='ai_summary', read_only=True)
     suspicionLevel = serializers.SerializerMethodField()
     suspicionFlags = serializers.SerializerMethodField()
 
@@ -490,6 +527,7 @@ class AnalyzeCompanyResponseSerializer(serializers.ModelSerializer):
             'consecutive_wins_score',
             'fake_competition_score',
             'ai_summary',
+            'aiSummary',
             'suspicionFlags',
         ]
 

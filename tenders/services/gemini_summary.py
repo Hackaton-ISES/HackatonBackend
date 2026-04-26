@@ -1,7 +1,10 @@
 import os
 
 
-def generate_company_summary(*, company, analysis) -> str:
+def generate_company_summary(*, company, analysis, raise_errors: bool = False) -> str:
+    if analysis.suspicion_level != 'high':
+        return ''
+
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         return ''
@@ -17,22 +20,27 @@ def generate_company_summary(*, company, analysis) -> str:
         reasons = '\n'.join(
             f'- {reason.title}: {reason.description}'
             for reason in analysis.reasons.all()
-        ) or '- No risk reasons triggered.'
+        ) or '- Xavf sabablari topilmadi.'
 
         prompt = (
-            'You are assisting an anti-corruption analyst. '
-            'Write a concise, evidence-based summary of why this company may be suspicious in 4 sentences or less. '
-            'Use only the provided reasons and statistics. Do not invent facts.\n'
-            f'Company name: {company.name}\n'
-            f'Total participations: {company.total_participations}\n'
-            f'Total wins: {company.total_wins}\n'
-            f'Completed projects: {company.completed_projects}\n'
-            f'Failed projects: {company.failed_projects}\n'
-            f'Total score: {analysis.total_score}\n'
-            f'Suspicion level: {analysis.suspicion_level}\n'
-            f'Reasons:\n{reasons}'
+            'Siz Oʻzbekistondagi davlat xaridlari bo‘yicha korrupsiyaga qarshi tahlilchiga '
+            'yordam berayotgan assistantsiz. Quyidagi dalillar asosida kompaniya nega yuqori '
+            'xavfli yoki shubhali ko‘rinishini oddiy inson tushunadigan Oʻzbek tilida, lotin '
+            'yozuvida tushuntiring. Javob 3-4 gapdan oshmasin. Faqat berilgan statistika va '
+            'sabablarni ishlating, yangi fakt o‘ylab topmang. Matn rasmiy, aniq va tushunarli '
+            'bo‘lsin.\n'
+            f'Kompaniya nomi: {company.name}\n'
+            f'Jami ishtiroklar: {company.total_participations}\n'
+            f'Jami g‘alabalar: {company.total_wins}\n'
+            f'Muvaffaqiyatli yakunlangan loyihalar: {company.completed_projects}\n'
+            f'Bajarilmagan yoki muvaffaqiyatsiz loyihalar: {company.failed_projects}\n'
+            f'Umumiy xavf bali: {analysis.total_score}\n'
+            f'Xavf darajasi: {analysis.suspicion_level}\n'
+            f'Sabablar:\n{reasons}'
         )
         response = client.models.generate_content(model=model_name, contents=prompt)
-        return getattr(response, 'text', '') or ''
+        return (getattr(response, 'text', '') or '').strip()
     except Exception:
+        if raise_errors:
+            raise
         return ''

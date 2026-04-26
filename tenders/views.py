@@ -99,17 +99,26 @@ class MeAPIView(GenericAPIView):
 
 
 class CompanyListAPIView(generics.ListCreateAPIView):
-    queryset = Company.objects.order_by('name')
     pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = Company.objects.select_related('suspicion_analysis').prefetch_related(
+            'suspicion_analysis__reasons',
+        )
+        if self.request.query_params.get('includeWonTenders') == 'true':
+            queryset = queryset.prefetch_related('won_tenders')
+        return queryset.order_by('name')
 
     def get_permissions(self):
         if self.request.method == 'POST':
             return [permissions.AllowAny()]
-        return [permissions.IsAuthenticated()]
+        return [permissions.AllowAny()]
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return CompanyRegistrationSerializer
+        if self.request.query_params.get('includeWonTenders') == 'true':
+            return CompanyDetailSerializer
         return CompanySerializer
 
     @extend_schema(request=CompanyRegistrationSerializer, responses=LoginResponseSerializer)
@@ -126,7 +135,7 @@ class CompanyListAPIView(generics.ListCreateAPIView):
 
 class CompanyDetailAPIView(generics.RetrieveAPIView):
     serializer_class = CompanyDetailSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     lookup_url_kwarg = 'company_id'
 
     def get_object(self):
@@ -310,7 +319,7 @@ class TenderFinalizeWinnerAPIView(GenericAPIView):
 
 
 class TenderAwardRiskAPIView(GenericAPIView):
-    permission_classes = [IsAdminUserProfileOrStaff]
+    permission_classes = [permissions.AllowAny]
     serializer_class = AwardRiskResponseSerializer
 
     @extend_schema(responses=AwardRiskResponseSerializer)
@@ -332,6 +341,7 @@ class CompanyAnalyzeAPIView(GenericAPIView):
 
 
 class CompanyStatsAPIView(GenericAPIView):
+    permission_classes = [permissions.AllowAny]
     serializer_class = CompanyStatsSerializer
 
     @extend_schema(responses=CompanyStatsSerializer)
@@ -340,6 +350,7 @@ class CompanyStatsAPIView(GenericAPIView):
 
 
 class CompanyFlagsAPIView(GenericAPIView):
+    permission_classes = [permissions.AllowAny]
     serializer_class = SuspicionFlagSerializer
 
     @extend_schema(responses=SuspicionFlagSerializer(many=True))
