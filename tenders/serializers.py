@@ -6,12 +6,53 @@ from django.db import transaction
 from rest_framework import serializers
 from drf_spectacular.utils import extend_schema_field
 
-from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile, ensure_user_profile
-from tenders.services.risk_scoring import analyze_tender
+from tenders.models import (
+    Company,
+    CompanySuspicionAnalysis,
+    CompanySuspicionReason,
+    Tender,
+    TenderBid,
+    UserProfile,
+    ensure_user_profile,
+)
+from tenders.services.account_creation import create_company_account
+from tenders.services.risk_scoring import analyze_all_companies, analyze_company
+
+
+class SuspicionReasonSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CompanySuspicionReason
+        fields = ['id', 'title', 'description', 'score', 'created_at']
+
+
+class SuspicionFlagSerializer(serializers.Serializer):
+    severity = serializers.ChoiceField(choices=['warning', 'critical'])
+    message = serializers.CharField()
+
+
+class CompanySuspicionAnalysisSerializer(serializers.ModelSerializer):
+    reasons = SuspicionReasonSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CompanySuspicionAnalysis
+        fields = [
+            'total_score',
+            'suspicion_level',
+            'price_score',
+            'failed_delivery_score',
+            'consecutive_wins_score',
+            'fake_competition_score',
+            'ai_summary',
+            'analyzed_at',
+            'reasons',
+        ]
 
 
 class CompanySerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='external_id', read_only=True)
+    suspicionScore = serializers.SerializerMethodField()
+    suspicionLevel = serializers.SerializerMethodField()
+    suspicionFlags = serializers.SerializerMethodField()
 
     class Meta:
         model = Company
@@ -24,7 +65,52 @@ class CompanySerializer(serializers.ModelSerializer):
             'failed_projects',
             'created_at',
             'updated_at',
+            'suspicionScore',
+            'suspicionLevel',
+            'suspicionFlags',
         ]
+
+    def _get_analysis(self, obj: Company) -> CompanySuspicionAnalysis:
+        if not hasattr(obj, '_analysis_cache'):
+            try:
+                obj._analysis_cache = obj.suspicion_analysis
+            except CompanySuspicionAnalysis.DoesNotExist:
+                obj._analysis_cache = analyze_company(obj)
+        return obj._analysis_cache
+
+    @extend_schema_field(serializers.IntegerField)
+    def get_suspicionScore(self, obj):
+        return self._get_analysis(obj).total_score
+
+    @extend_schema_field(serializers.CharField)
+    def get_suspicionLevel(self, obj):
+        return self._get_analysis(obj).suspicion_level.upper()
+
+    @extend_schema_field(SuspicionFlagSerializer(many=True))
+    def get_suspicionFlags(self, obj):
+        return [
+            {
+                'severity': 'critical' if reason.score >= 15 else 'warning',
+                'message': reason.description,
+            }
+            for reason in self._get_analysis(obj).reasons.all()
+        ]
+
+
+class CompanyDetailSerializer(CompanySerializer):
+    suspicionAnalysis = serializers.SerializerMethodField()
+    reasons = serializers.SerializerMethodField()
+
+    class Meta(CompanySerializer.Meta):
+        fields = CompanySerializer.Meta.fields + ['suspicionAnalysis', 'reasons']
+
+    @extend_schema_field(CompanySuspicionAnalysisSerializer)
+    def get_suspicionAnalysis(self, obj):
+        return CompanySuspicionAnalysisSerializer(self._get_analysis(obj)).data
+
+    @extend_schema_field(SuspicionReasonSerializer(many=True))
+    def get_reasons(self, obj):
+        return SuspicionReasonSerializer(self._get_analysis(obj).reasons.all(), many=True).data
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
@@ -91,82 +177,44 @@ class CompanyRegistrationSerializer(serializers.Serializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        company = Company.objects.create(name=validated_data['company_name'])
-        user = User.objects.create_user(
+        return create_company_account(
+            company_name=validated_data['company_name'],
             username=validated_data['username'],
-            email=validated_data.get('email', ''),
             password=validated_data['password'],
+            email=validated_data.get('email', ''),
             first_name=validated_data.get('first_name', ''),
             last_name=validated_data.get('last_name', ''),
         )
-        UserProfile.objects.create(
-            user=user,
-            role=UserProfile.Role.COMPANY,
-            company=company,
-            external_id=company.external_id,
-        )
-        return user
 
 
-class TenderBidSerializer(serializers.ModelSerializer):
-    company = CompanySerializer(read_only=True)
-    status = serializers.CharField(read_only=True)
-
-    class Meta:
-        model = TenderBid
-        fields = ['external_id', 'company', 'bid_price', 'is_winner', 'status', 'created_at']
-
-
-class RiskReasonSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = RiskReason
-        fields = ['id', 'title', 'description', 'score', 'created_at']
-
-
-class RiskFlagSerializer(serializers.Serializer):
-    severity = serializers.ChoiceField(choices=['warning', 'critical'])
-    message = serializers.CharField()
-
-
-class TenderRiskAnalysisSerializer(serializers.ModelSerializer):
-    reasons = RiskReasonSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = TenderRiskAnalysis
-        fields = [
-            'total_score',
-            'risk_level',
-            'price_score',
-            'company_history_score',
-            'consecutive_wins_score',
-            'participants_score',
-            'fake_competition_score',
-            'ai_summary',
-            'analyzed_at',
-            'reasons',
-        ]
-
-
-class RiskStatsSerializer(serializers.Serializer):
+class CompanyStatsSerializer(serializers.Serializer):
     total = serializers.IntegerField()
     high = serializers.IntegerField()
     medium = serializers.IntegerField()
     low = serializers.IntegerField()
     distribution = serializers.DictField(child=serializers.IntegerField())
-    top_risky_organizations = serializers.ListField(child=serializers.DictField())
-    total_analyzed_tenders = serializers.IntegerField()
+    top_suspicious_companies = serializers.ListField(child=serializers.DictField())
+    total_analyzed_companies = serializers.IntegerField()
 
 
 class TenderAnalysisSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='external_id', read_only=True)
     participantsCount = serializers.SerializerMethodField()
-    averageMarketPrice = serializers.DecimalField(source='average_market_price', max_digits=14, decimal_places=2, read_only=True)
-    finalPrice = serializers.DecimalField(source='final_price', max_digits=14, decimal_places=2, read_only=True)
+    averageMarketPrice = serializers.DecimalField(
+        source='average_market_price',
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+    finalPrice = serializers.DecimalField(
+        source='final_price',
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
     createdAt = serializers.DateTimeField(source='created_at', read_only=True)
-    riskScore = serializers.SerializerMethodField()
-    riskLevel = serializers.SerializerMethodField()
-    riskFlags = serializers.SerializerMethodField()
     winnerCompanyId = serializers.SerializerMethodField()
+    winnerLocked = serializers.SerializerMethodField()
 
     class Meta:
         model = Tender
@@ -180,52 +228,11 @@ class TenderAnalysisSerializer(serializers.ModelSerializer):
             'finalPrice',
             'participantsCount',
             'winnerCompanyId',
+            'winnerLocked',
             'status',
             'createdAt',
             'deadline',
-            'riskScore',
-            'riskLevel',
-            'riskFlags',
         ]
-
-    def _get_analysis(self, obj: Tender) -> TenderRiskAnalysis | None:
-        if not hasattr(obj, '_analysis_cache'):
-            try:
-                obj._analysis_cache = obj.risk_analysis
-            except TenderRiskAnalysis.DoesNotExist:
-                if self.context.get('auto_analyze', False):
-                    obj._analysis_cache = analyze_tender(obj)
-                else:
-                    obj._analysis_cache = None
-        return obj._analysis_cache
-
-    @extend_schema_field(serializers.IntegerField)
-    def _build_flags(self, obj):
-        analysis = self._get_analysis(obj)
-        if analysis is None:
-            return []
-        reasons = analysis.reasons.all()
-        return [
-            {
-                'severity': 'critical' if reason.score >= 15 else 'warning',
-                'message': reason.description,
-            }
-            for reason in reasons
-        ]
-
-    @extend_schema_field(serializers.IntegerField)
-    def get_riskScore(self, obj):
-        analysis = self._get_analysis(obj)
-        return analysis.total_score if analysis else 0
-
-    @extend_schema_field(serializers.CharField)
-    def get_riskLevel(self, obj):
-        analysis = self._get_analysis(obj)
-        return analysis.risk_level.upper() if analysis else 'LOW'
-
-    @extend_schema_field(RiskFlagSerializer(many=True))
-    def get_riskFlags(self, obj):
-        return self._build_flags(obj)
 
     @extend_schema_field(serializers.IntegerField)
     def get_participantsCount(self, obj):
@@ -235,28 +242,16 @@ class TenderAnalysisSerializer(serializers.ModelSerializer):
     def get_winnerCompanyId(self, obj):
         return obj.winner_company.external_id if obj.winner_company else None
 
+    @extend_schema_field(serializers.BooleanField)
+    def get_winnerLocked(self, obj):
+        return bool(obj.winner_company_id)
+
 
 class TenderDetailSerializer(TenderAnalysisSerializer):
-    riskAnalysis = serializers.SerializerMethodField()
-    reasons = serializers.SerializerMethodField()
     bids = serializers.SerializerMethodField()
 
     class Meta(TenderAnalysisSerializer.Meta):
-        fields = TenderAnalysisSerializer.Meta.fields + ['riskAnalysis', 'reasons', 'bids']
-
-    @extend_schema_field(TenderRiskAnalysisSerializer)
-    def get_riskAnalysis(self, obj):
-        analysis = self._get_analysis(obj)
-        if analysis is None:
-            return None
-        return TenderRiskAnalysisSerializer(analysis).data
-
-    @extend_schema_field(RiskReasonSerializer(many=True))
-    def get_reasons(self, obj):
-        analysis = self._get_analysis(obj)
-        if analysis is None:
-            return []
-        return RiskReasonSerializer(analysis.reasons.all(), many=True).data
+        fields = TenderAnalysisSerializer.Meta.fields + ['bids']
 
     @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_bids(self, obj):
@@ -295,35 +290,18 @@ class TenderCreateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        tender = Tender.objects.create(
+        return Tender.objects.create(
             participants_count=0,
             status=Tender.Status.ACTIVE,
             is_completed_by_winner=None,
             winner_company=None,
             **validated_data,
         )
-        analyze_tender(tender)
-        return tender
 
 
 class TenderWriteSerializer(serializers.ModelSerializer):
-    participant_ids = serializers.PrimaryKeyRelatedField(
-        many=True,
-        queryset=Company.objects.all(),
-        write_only=True,
-        source='participants',
-        required=False,
-    )
-    winner_company_id = serializers.PrimaryKeyRelatedField(
-        queryset=Company.objects.all(),
-        write_only=True,
-        source='winner_company',
-        allow_null=True,
-        required=False,
-    )
-    bids = serializers.ListField(child=serializers.DictField(), write_only=True, required=False)
-    risk_analysis = serializers.SerializerMethodField(read_only=True)
-    reasons = serializers.SerializerMethodField(read_only=True)
+    winnerCompanyId = serializers.SerializerMethodField(read_only=True)
+    winnerLocked = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Tender
@@ -335,107 +313,43 @@ class TenderWriteSerializer(serializers.ModelSerializer):
             'budget',
             'average_market_price',
             'final_price',
-            'participant_ids',
-            'participants_count',
-            'winner_company_id',
-            'status',
             'created_at',
             'deadline',
-            'added_at',
-            'updated_at',
-            'bids',
-            'risk_analysis',
-            'reasons',
+            'status',
+            'winnerCompanyId',
+            'winnerLocked',
         ]
         read_only_fields = [
             'id',
-            'participants_count',
-            'added_at',
-            'updated_at',
-            'risk_analysis',
-            'reasons',
+            'final_price',
+            'created_at',
+            'status',
+            'winnerCompanyId',
+            'winnerLocked',
         ]
 
     def validate(self, attrs):
-        participants = attrs.get('participants')
-        winner_company = attrs.get('winner_company')
-        created_at = attrs.get('created_at', getattr(self.instance, 'created_at', None))
+        created_at = getattr(self.instance, 'created_at', None)
         deadline = attrs.get('deadline', getattr(self.instance, 'deadline', None))
-
-        if participants is None and self.instance is not None:
-            participants = list(self.instance.participants.all())
-        elif participants is None:
-            participants = []
-
-        if participants and winner_company and winner_company not in participants:
-            raise serializers.ValidationError(
-                {'winner_company_id': 'Winner company must be one of the participants.'}
-            )
-        if not participants and winner_company:
-            raise serializers.ValidationError(
-                {'winner_company_id': 'Winner company cannot be set before participants join the tender.'}
-            )
-
         if created_at and deadline and deadline <= created_at:
             raise serializers.ValidationError({'deadline': 'Deadline must be later than created_at.'})
         return attrs
 
-    def _replace_bids(self, tender: Tender, bids_payload: list[dict]) -> None:
-        if bids_payload is None:
-            return
-        tender.bids.all().delete()
-        for bid_item in bids_payload:
-            company_id = bid_item.get('company_id')
-            if company_id is None:
-                continue
-            TenderBid.objects.create(
-                tender=tender,
-                company_id=company_id,
-                bid_price=bid_item['bid_price'],
-                is_winner=bid_item.get('is_winner', False),
-            )
-
-    @transaction.atomic
-    def create(self, validated_data):
-        participants = list(validated_data.pop('participants', []))
-        bids_payload = validated_data.pop('bids', [])
-        tender = Tender.objects.create(participants_count=len(participants), **validated_data)
-        tender.participants.set(participants)
-        self._replace_bids(tender, bids_payload)
-        for participant in participants:
-            participant.update_statistics()
-        if tender.winner_company:
-            tender.winner_company.update_statistics()
-        analyze_tender(tender)
-        return tender
-
     @transaction.atomic
     def update(self, instance, validated_data):
-        participants = validated_data.pop('participants', None)
-        bids_payload = validated_data.pop('bids', None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
-        if participants is not None:
-            participants = list(participants)
-            instance.participants_count = len(participants)
         instance.save()
-        if participants is not None:
-            instance.participants.set(participants)
-            for participant in participants:
-                participant.update_statistics()
-        self._replace_bids(instance, bids_payload)
-        if instance.winner_company:
-            instance.winner_company.update_statistics()
-        analyze_tender(instance)
+        analyze_all_companies()
         return instance
 
-    @extend_schema_field(TenderRiskAnalysisSerializer)
-    def get_risk_analysis(self, obj):
-        return TenderRiskAnalysisSerializer(analyze_tender(obj)).data
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_winnerCompanyId(self, obj):
+        return obj.winner_company.external_id if obj.winner_company else None
 
-    @extend_schema_field(RiskReasonSerializer(many=True))
-    def get_reasons(self, obj):
-        return RiskReasonSerializer(analyze_tender(obj).reasons.all(), many=True).data
+    @extend_schema_field(serializers.BooleanField)
+    def get_winnerLocked(self, obj):
+        return bool(obj.winner_company_id)
 
 
 class ApplicationSerializer(serializers.ModelSerializer):
@@ -481,7 +395,6 @@ class ApplicationSerializer(serializers.ModelSerializer):
 
         if tender.status != Tender.Status.ACTIVE:
             raise serializers.ValidationError('Bids can only be submitted to active tenders.')
-
         if company is None:
             raise serializers.ValidationError({'company_id': 'Company is required.'})
 
@@ -496,8 +409,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
         application.tender.participants.add(application.company)
         application.tender.participants_count = application.tender.get_actual_participants_count()
         application.tender.save(update_fields=['participants_count', 'updated_at'])
-        application.company.update_statistics()
-        analyze_tender(application.tender)
+        analyze_all_companies()
         return application
 
 
@@ -510,7 +422,12 @@ class FrontendApplicationSerializer(serializers.ModelSerializer):
     tenderId = serializers.CharField(source='tender.external_id', read_only=True)
     companyId = serializers.CharField(source='company.external_id', read_only=True)
     companyName = serializers.CharField(source='company.name', read_only=True)
-    proposedPrice = serializers.DecimalField(source='bid_price', max_digits=14, decimal_places=2, read_only=True)
+    proposedPrice = serializers.DecimalField(
+        source='bid_price',
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
     productName = serializers.CharField(source='product_name', read_only=True)
     productDescription = serializers.CharField(source='product_description', read_only=True)
     status = serializers.SerializerMethodField()
@@ -545,38 +462,43 @@ class FrontendApplicationCreateSerializer(serializers.Serializer):
     tenderId = serializers.CharField()
     companyId = serializers.CharField()
     companyName = serializers.CharField(min_length=1, max_length=100)
-    proposedPrice = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal('0.01'))
+    proposedPrice = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+    )
     productName = serializers.CharField(min_length=1, max_length=120)
     productDescription = serializers.CharField(min_length=1, max_length=1000)
 
 
-class AnalyzeTenderResponseSerializer(serializers.ModelSerializer):
-    tenderId = serializers.CharField(source='tender.external_id', read_only=True)
+class AnalyzeCompanyResponseSerializer(serializers.ModelSerializer):
+    companyId = serializers.CharField(source='company.external_id', read_only=True)
+    companyName = serializers.CharField(source='company.name', read_only=True)
     totalScore = serializers.IntegerField(source='total_score', read_only=True)
-    riskLevel = serializers.SerializerMethodField()
-    riskFlags = serializers.SerializerMethodField()
+    suspicionLevel = serializers.SerializerMethodField()
+    suspicionFlags = serializers.SerializerMethodField()
 
     class Meta:
-        model = TenderRiskAnalysis
+        model = CompanySuspicionAnalysis
         fields = [
-            'tenderId',
+            'companyId',
+            'companyName',
             'totalScore',
-            'riskLevel',
+            'suspicionLevel',
             'price_score',
-            'company_history_score',
+            'failed_delivery_score',
             'consecutive_wins_score',
-            'participants_score',
             'fake_competition_score',
             'ai_summary',
-            'riskFlags',
+            'suspicionFlags',
         ]
 
     @extend_schema_field(serializers.CharField)
-    def get_riskLevel(self, obj):
-        return obj.risk_level.upper()
+    def get_suspicionLevel(self, obj):
+        return obj.suspicion_level.upper()
 
-    @extend_schema_field(RiskFlagSerializer(many=True))
-    def get_riskFlags(self, obj):
+    @extend_schema_field(SuspicionFlagSerializer(many=True))
+    def get_suspicionFlags(self, obj):
         return [
             {
                 'severity': 'critical' if reason.score >= 15 else 'warning',
@@ -584,3 +506,45 @@ class AnalyzeTenderResponseSerializer(serializers.ModelSerializer):
             }
             for reason in obj.reasons.all()
         ]
+
+
+class FinalizeWinnerSerializer(serializers.Serializer):
+    applicationId = serializers.CharField()
+
+
+class FinalizeWinnerResponseSerializer(serializers.Serializer):
+    tenderId = serializers.CharField()
+    winnerCompanyId = serializers.CharField(allow_null=True)
+    winnerApplicationId = serializers.CharField()
+    locked = serializers.BooleanField()
+    applications = FrontendApplicationSerializer(many=True)
+
+
+class AwardRiskReasonSerializer(serializers.Serializer):
+    rule = serializers.CharField()
+    title = serializers.CharField()
+    description = serializers.CharField()
+    severity = serializers.CharField()
+    points = serializers.IntegerField()
+
+
+class AwardRiskParticipantSerializer(serializers.Serializer):
+    applicationId = serializers.CharField()
+    companyId = serializers.CharField()
+    companyName = serializers.CharField()
+    proposedPrice = serializers.DecimalField(max_digits=14, decimal_places=2)
+    priceDeltaPercent = serializers.IntegerField()
+    companySuspicionScore = serializers.IntegerField()
+    companySuspicionLevel = serializers.CharField()
+    failedProjects = serializers.IntegerField()
+    totalWins = serializers.IntegerField()
+    recommendation = serializers.CharField()
+    recommendationLabel = serializers.CharField()
+    reasons = AwardRiskReasonSerializer(many=True)
+
+
+class AwardRiskResponseSerializer(serializers.Serializer):
+    tenderId = serializers.CharField()
+    baseline = serializers.DictField()
+    participants = AwardRiskParticipantSerializer(many=True)
+    generatedAt = serializers.DateTimeField()

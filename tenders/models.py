@@ -73,6 +73,79 @@ class Company(models.Model):
             )
 
 
+class CompanySuspicionAnalysis(models.Model):
+    class SuspicionLevel(models.TextChoices):
+        LOW = 'low', 'Low'
+        MEDIUM = 'medium', 'Medium'
+        HIGH = 'high', 'High'
+
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='suspicion_analysis',
+    )
+    total_score = models.PositiveIntegerField(default=0)
+    suspicion_level = models.CharField(
+        max_length=10,
+        choices=SuspicionLevel.choices,
+        default=SuspicionLevel.LOW,
+    )
+    price_score = models.PositiveIntegerField(default=0)
+    failed_delivery_score = models.PositiveIntegerField(default=0)
+    consecutive_wins_score = models.PositiveIntegerField(default=0)
+    fake_competition_score = models.PositiveIntegerField(default=0)
+    ai_summary = models.TextField(blank=True, default='')
+    analyzed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-total_score', 'company__name']
+
+    def __str__(self) -> str:
+        return f'Suspicion analysis for {self.company}'
+
+    def calculate_total_score(self) -> int:
+        self.total_score = min(
+            self.price_score
+            + self.failed_delivery_score
+            + self.consecutive_wins_score
+            + self.fake_competition_score,
+            100,
+        )
+        return self.total_score
+
+    def update_suspicion_level(self) -> str:
+        if self.total_score >= 70:
+            self.suspicion_level = self.SuspicionLevel.HIGH
+        elif self.total_score >= 40:
+            self.suspicion_level = self.SuspicionLevel.MEDIUM
+        else:
+            self.suspicion_level = self.SuspicionLevel.LOW
+        return self.suspicion_level
+
+    def save(self, *args, **kwargs):
+        self.calculate_total_score()
+        self.update_suspicion_level()
+        super().save(*args, **kwargs)
+
+
+class CompanySuspicionReason(models.Model):
+    analysis = models.ForeignKey(
+        CompanySuspicionAnalysis,
+        on_delete=models.CASCADE,
+        related_name='reasons',
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    score = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-score', '-created_at', '-id']
+
+    def __str__(self) -> str:
+        return self.title
+
+
 class UserProfile(models.Model):
     class Role(models.TextChoices):
         ADMIN = 'admin', 'Admin'

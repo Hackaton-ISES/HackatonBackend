@@ -1,36 +1,41 @@
 from django.contrib.auth import logout
-from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, permissions, status
-from rest_framework.generics import GenericAPIView
-from rest_framework.authtoken.models import Token
-from rest_framework.response import Response
-from rest_framework.views import APIView
 from drf_spectacular.utils import extend_schema
+from rest_framework import generics, permissions, status
+from rest_framework.authtoken.models import Token
+from rest_framework.generics import GenericAPIView
+from rest_framework.response import Response
 
-from tenders.models import Company, RiskReason, Tender, TenderBid, UserProfile, ensure_user_profile
+from tenders.models import Company, Tender, TenderBid, UserProfile, ensure_user_profile
+from tenders.pagination import StandardResultsSetPagination
 from tenders.permissions import IsAdminOrReadOnly, IsAdminUserProfileOrStaff
 from tenders.serializers import (
-    AnalyzeTenderResponseSerializer,
+    AnalyzeCompanyResponseSerializer,
     ApplicationSerializer,
     ApplicationStatusSerializer,
+    AwardRiskResponseSerializer,
     AuthUserSerializer,
+    CompanyDetailSerializer,
     CompanyRegistrationSerializer,
     CompanySerializer,
+    CompanyStatsSerializer,
+    FinalizeWinnerResponseSerializer,
+    FinalizeWinnerSerializer,
     FrontendApplicationCreateSerializer,
     FrontendApplicationSerializer,
-    LoginSerializer,
     LoginResponseSerializer,
-    RiskReasonSerializer,
-    RiskStatsSerializer,
+    LoginSerializer,
+    SuspicionFlagSerializer,
     TenderAnalysisSerializer,
     TenderCreateSerializer,
     TenderDetailSerializer,
     TenderWriteSerializer,
 )
-from tenders.services.risk_scoring import analyze_tender, get_risk_stats
+from tenders.services.award_risk import get_tender_award_risk
+from tenders.services.risk_scoring import analyze_all_companies, analyze_company, get_company_stats
+from tenders.services.tender_finalization import finalize_tender_winner
 
 
 def get_tender_by_identifier(identifier: str) -> Tender:
@@ -38,9 +43,7 @@ def get_tender_by_identifier(identifier: str) -> Tender:
     if identifier.isdigit():
         query |= Q(pk=int(identifier))
     return get_object_or_404(
-        Tender.objects.select_related('winner_company', 'risk_analysis').prefetch_related(
-            'participants', 'bids__company', 'risk_analysis__reasons'
-        ),
+        Tender.objects.select_related('winner_company').prefetch_related('participants', 'bids__company'),
         query,
     )
 
@@ -50,6 +53,16 @@ def get_bid_by_identifier(identifier: str) -> TenderBid:
     if identifier.isdigit():
         query |= Q(pk=int(identifier))
     return get_object_or_404(TenderBid.objects.select_related('tender', 'company'), query)
+
+
+def get_company_by_identifier(identifier: str) -> Company:
+    query = Q(external_id=identifier)
+    if identifier.isdigit():
+        query |= Q(pk=int(identifier))
+    return get_object_or_404(
+        Company.objects.prefetch_related('won_tenders__participants', 'won_tenders__bids__company'),
+        query,
+    )
 
 
 class LoginAPIView(GenericAPIView):
@@ -85,29 +98,61 @@ class MeAPIView(GenericAPIView):
         return Response(AuthUserSerializer(request.user).data)
 
 
+class CompanyListAPIView(generics.ListCreateAPIView):
+    queryset = Company.objects.order_by('name')
+    pagination_class = StandardResultsSetPagination
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return CompanyRegistrationSerializer
+        return CompanySerializer
+
+    @extend_schema(request=CompanyRegistrationSerializer, responses=LoginResponseSerializer)
+    def post(self, request, *args, **kwargs):
+        serializer = CompanyRegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response(
+            {'user': AuthUserSerializer(user).data, 'token': token.key},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CompanyDetailAPIView(generics.RetrieveAPIView):
+    serializer_class = CompanyDetailSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_url_kwarg = 'company_id'
+
+    def get_object(self):
+        return get_company_by_identifier(self.kwargs['company_id'])
+
+
 class TenderListCreateAPIView(generics.ListCreateAPIView):
     queryset = (
-        Tender.objects.select_related('winner_company', 'risk_analysis')
-        .prefetch_related('participants', 'bids__company', 'risk_analysis__reasons')
+        Tender.objects.select_related('winner_company')
+        .prefetch_related('participants', 'bids__company')
         .order_by('-created_at', '-id')
     )
     permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardResultsSetPagination
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return TenderCreateSerializer
         return TenderAnalysisSerializer
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context['auto_analyze'] = False
-        return context
-
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         tender = serializer.save()
-        output = TenderDetailSerializer(tender, context={'auto_analyze': False})
+        analyze_all_companies()
+        output = TenderDetailSerializer(tender)
         headers = self.get_success_headers(output.data)
         return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -121,17 +166,26 @@ class TenderDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             return TenderWriteSerializer
         return TenderDetailSerializer
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context['auto_analyze'] = True
-        return context
-
     def get_object(self):
         return get_tender_by_identifier(self.kwargs['tender_id'])
+
+    def update(self, request, *args, **kwargs):
+        tender = self.get_object()
+        if tender.winner_company_id:
+            return Response(
+                {'detail': 'Tender fields are locked after winner finalization.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return super().update(request, *args, **kwargs)
+
+    def perform_destroy(self, instance):
+        instance.delete()
+        analyze_all_companies()
 
 
 class ApplicationListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = FrontendApplicationSerializer
+    pagination_class = StandardResultsSetPagination
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
@@ -164,7 +218,10 @@ class ApplicationListCreateAPIView(generics.ListCreateAPIView):
 
         profile = getattr(request.user, 'profile', None)
         if not request.user.is_staff and (not profile or profile.company_id != company.id):
-            return Response({'detail': 'You can only submit bids for your own company.'}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {'detail': 'You can only submit bids for your own company.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         application = TenderBid.objects.create(
             tender=tender,
@@ -178,10 +235,9 @@ class ApplicationListCreateAPIView(generics.ListCreateAPIView):
             company.save(update_fields=['name', 'updated_at'])
 
         tender.participants.add(company)
-        tender.participants_count += 1
+        tender.participants_count = tender.get_actual_participants_count()
         tender.save(update_fields=['participants_count', 'updated_at'])
-        company.update_statistics()
-        analyze_tender(tender)
+        analyze_all_companies()
 
         output = FrontendApplicationSerializer(application)
         return Response(output.data, status=status.HTTP_201_CREATED)
@@ -199,51 +255,97 @@ class ApplicationStatusAPIView(GenericAPIView):
         serializer.is_valid(raise_exception=True)
         new_status = serializer.validated_data['status']
 
-        if new_status == 'won':
-            application.tender.bids.update(is_winner=False)
-            application.is_winner = True
-            application.save(update_fields=['is_winner'])
-            application.tender.winner_company = application.company
-            application.tender.status = Tender.Status.COMPLETED
-            application.tender.save(update_fields=['winner_company', 'status', 'updated_at'])
-        else:
-            application.is_winner = False
-            application.save(update_fields=['is_winner'])
+        if application.tender.winner_company_id:
+            return Response(
+                {'detail': 'Winner has already been finalized for this tender.'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-        application.company.update_statistics()
-        if application.tender.winner_company:
-            application.tender.winner_company.update_statistics()
-        analyze_tender(application.tender)
+        if new_status != 'won':
+            return Response(
+                {'detail': 'Use tender winner finalization to select the winner.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            finalize_tender_winner(tender=application.tender, application=application)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        application.refresh_from_db()
         return Response(FrontendApplicationSerializer(application).data)
 
 
-class TenderAnalyzeAPIView(GenericAPIView):
+class TenderFinalizeWinnerAPIView(GenericAPIView):
     permission_classes = [IsAdminUserProfileOrStaff]
-    serializer_class = AnalyzeTenderResponseSerializer
+    serializer_class = FinalizeWinnerSerializer
 
-    @extend_schema(request=None, responses=AnalyzeTenderResponseSerializer)
-    def post(self, request, pk: str):
-        tender = get_tender_by_identifier(pk)
-        analysis = analyze_tender(tender)
-        serializer = AnalyzeTenderResponseSerializer(analysis)
+    @extend_schema(request=FinalizeWinnerSerializer, responses=FinalizeWinnerResponseSerializer)
+    def post(self, request, tender_id: str):
+        tender = get_tender_by_identifier(tender_id)
+        serializer = FinalizeWinnerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        application = get_bid_by_identifier(serializer.validated_data['applicationId'])
+
+        try:
+            finalize_tender_winner(tender=tender, application=application)
+        except ValueError as exc:
+            status_code = (
+                status.HTTP_400_BAD_REQUEST
+                if 'does not belong' in str(exc)
+                else status.HTTP_409_CONFLICT
+            )
+            return Response({'detail': str(exc)}, status=status_code)
+
+        tender = get_tender_by_identifier(tender_id)
+        winner_bid = tender.bids.filter(is_winner=True).first()
+        payload = {
+            'tenderId': tender.external_id,
+            'winnerCompanyId': tender.winner_company.external_id if tender.winner_company else None,
+            'winnerApplicationId': winner_bid.external_id if winner_bid else application.external_id,
+            'locked': bool(tender.winner_company_id),
+            'applications': FrontendApplicationSerializer(tender.bids.all(), many=True).data,
+        }
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class TenderAwardRiskAPIView(GenericAPIView):
+    permission_classes = [IsAdminUserProfileOrStaff]
+    serializer_class = AwardRiskResponseSerializer
+
+    @extend_schema(responses=AwardRiskResponseSerializer)
+    def get(self, request, tender_id: str):
+        tender = get_tender_by_identifier(tender_id)
+        return Response(get_tender_award_risk(tender))
+
+
+class CompanyAnalyzeAPIView(GenericAPIView):
+    permission_classes = [IsAdminUserProfileOrStaff]
+    serializer_class = AnalyzeCompanyResponseSerializer
+
+    @extend_schema(request=None, responses=AnalyzeCompanyResponseSerializer)
+    def post(self, request, company_id: str):
+        company = get_company_by_identifier(company_id)
+        analysis = analyze_company(company)
+        serializer = AnalyzeCompanyResponseSerializer(analysis)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class RiskStatsAPIView(GenericAPIView):
-    serializer_class = RiskStatsSerializer
+class CompanyStatsAPIView(GenericAPIView):
+    serializer_class = CompanyStatsSerializer
 
-    @extend_schema(responses=RiskStatsSerializer)
+    @extend_schema(responses=CompanyStatsSerializer)
     def get(self, request):
-        return Response(get_risk_stats())
+        return Response(get_company_stats())
 
 
-class RiskFlagsAPIView(GenericAPIView):
-    serializer_class = RiskReasonSerializer
+class CompanyFlagsAPIView(GenericAPIView):
+    serializer_class = SuspicionFlagSerializer
 
-    @extend_schema(responses=RiskReasonSerializer(many=True))
-    def get(self, request, tender_id: str):
-        tender = get_tender_by_identifier(tender_id)
-        analysis = analyze_tender(tender)
+    @extend_schema(responses=SuspicionFlagSerializer(many=True))
+    def get(self, request, company_id: str):
+        company = get_company_by_identifier(company_id)
+        analysis = analyze_company(company)
         return Response(
             [
                 {

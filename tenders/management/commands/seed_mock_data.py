@@ -4,8 +4,8 @@ from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from tenders.models import Company, RiskReason, Tender, TenderBid, TenderRiskAnalysis, UserProfile
-from tenders.services.risk_scoring import analyze_tender
+from tenders.models import Company, Tender, TenderBid, UserProfile
+from tenders.services.risk_scoring import analyze_all_companies
 
 
 DEMO_USERNAMES = ['admin', 'acme', 'nova']
@@ -186,7 +186,7 @@ class Command(BaseCommand):
         now = timezone.now()
 
         def create_tender(
-            *, external_id, participants, bids=None, late_bid_company=None, analyze=True, **kwargs
+            *, external_id, participants, bids=None, late_bid_company=None, **kwargs
         ):
             tender, _ = Tender.objects.update_or_create(
                 external_id=external_id,
@@ -202,10 +202,6 @@ class Command(BaseCommand):
                     TenderBid.objects.filter(pk=created_bid.pk).update(
                         created_at=tender.deadline + timezone.timedelta(hours=2)
                     )
-            if tender.winner_company:
-                tender.winner_company.update_statistics()
-            if analyze:
-                analyze_tender(tender)
             return tender
 
         create_tender(
@@ -315,6 +311,8 @@ class Command(BaseCommand):
             ],
             late_bid_company=companies['Delta Supplies'],
         )
+
+        analyze_all_companies()
 
         self.stdout.write(
             self.style.SUCCESS(
